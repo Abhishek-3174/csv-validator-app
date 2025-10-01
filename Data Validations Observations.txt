@@ -1,0 +1,75 @@
+batch_balances_2025-05-27_214100.csv
+    Mandatory Feild Check -> Done
+    Duplicates -> 1469
+    Data Type Issues:-
+        lot_status -> Not yet defined with data type
+-------------------------------
+
+campaigns_2025057_123440 (1).csv
+    Mandatory Feild Check -> Done
+        Missing field metrics:
+            - adtype: 750 missing(present as NULL)
+    Duplicates -> 1367
+    Data Type Issues:-
+        CustNo,SKU -> Didn't mention expected data type in interface doc
+
+-------------------------------
+
+end_customers_2025-05-27_213300.csv
+    Mandatory Feild Check -> Done
+        Missing field metrics:
+            - address_line3: 102 missing
+            - address_line4: 3206 missing
+    Duplicates -> 0
+
+customer_group_description is mentioned as customer_group_desc in interface
+-------------------------------
+
+locations_2025_05-27-211700.csv
+    Mandatory Feild Check -> Done
+    Duplicates -> 0
+
+-------------------------------
+
+product_groups_2025-05-27_212400.csv
+    Mandatory Feild Check -> Done
+    Duplicates -> 0
+
+-------------------------------
+
+product_locations_2025-05-27_212900.csv
+    Mandatory Feild Check -> Done
+    Duplicates -> 0
+-------------------------------
+
+products_2025_05-27_211900.csv
+    Missing field metrics:
+        - product_group_3: 42 missing
+        - net_weight: 252 missing
+    Duplicates -> 0
+    Data Type : 
+        gross_weight -> Not yet defined with data type
+-------------------------------
+
+suppliers_2025_05-27_213500.csv
+    Mandatory Feild Check -> Done
+    Duplicates -> 0
+    Data Type : 
+        supplier_class,supplier_class_description -> Not yet defined with data type
+-------------------------------
+
+
+batch_balances_2025-05-30_174500.csv
+    Mandatory Feild Check -> Done
+    Duplicates -> 1432
+-------------------------------
+
+inventory_transactions_2025-05-30_230900.csv
+    Mandatory Feild Check -> Done (reference,order_row) are mentioned as key columns and these columns are not in dataset.
+    Duplicates -> 199
+
+
+
+
+
+1. Should Batch Balances include balance filed in output workflow despite it is mentioned like "NO" included in file column interface?
