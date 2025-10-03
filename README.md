@@ -58,7 +58,7 @@ source venv/bin/activate  # On macOS/Linux
 venv\Scripts\activate     # On Windows
 
 # Run the application
-python csv_gui_tool.py
+python3 csv_gui_tool.py
 ```
 
 ## Usage Guide
