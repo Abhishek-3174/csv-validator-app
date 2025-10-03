@@ -25,7 +25,8 @@ pip install -r requirements.txt
 
 ### 2. Run the App
 ```bash
-python csv_gui_tool```
+python csv_gui_tool.py
+```
 
 That's it! The GUI will open and you can start validating your CSV files.
 
