@@ -5,6 +5,7 @@ from tkinter import filedialog, messagebox
 import re
 from datetime import datetime
 import csv
+import os
 from CSVDataValidator import CSVDataValidator
 from csv_diff_tool import run_diff
 from regex_checker import open_regex_check_window
@@ -15,7 +16,13 @@ from pyspark.sql.functions import expr
 from vlookup_tool import open_vlookup_window
 
 
-spark = SparkSession.builder.appName("CSVValidator").getOrCreate()
+try:
+    spark = SparkSession.builder.appName("CSVValidator").getOrCreate()
+    SPARK_AVAILABLE = True
+except Exception as e:
+    print(f"PySpark not available: {e}")
+    spark = None
+    SPARK_AVAILABLE = False
 
 
 class CSVValidatorApp:
@@ -25,12 +32,25 @@ class CSVValidatorApp:
         master.geometry("700x600")
 
         self.df = None
+        self.sdf = None  # Spark DataFrame - created once and reused
         self.file_path = None
+        self.parquet_path = None
         self.check_vars = {}
         self.type_vars = {}
 
-        self.upload_button = tk.Button(master, text="Upload CSV", command=self.load_csv)
-        self.upload_button.pack(pady=10)
+        # Upload and Cache buttons frame
+        button_frame = tk.Frame(master)
+        button_frame.pack(pady=10)
+        
+        self.upload_button = tk.Button(button_frame, text="Upload CSV", command=self.load_csv)
+        self.upload_button.pack(side=tk.LEFT, padx=5)
+        
+        self.clear_cache_button = tk.Button(
+            button_frame, 
+            text="Clear Cache", 
+            command=self.clear_cache
+        )
+        self.clear_cache_button.pack(side=tk.LEFT, padx=5)
 
         self.check_frame = tk.LabelFrame(master, text="Select Columns & Data Types", padx=10, pady=10)
         self.check_frame.pack(fill="both", expand=True, padx=20, pady=10)
@@ -112,22 +132,71 @@ class CSVValidatorApp:
             return
 
         try:
-            with open(file_path, 'r', encoding='iso-8859-1') as f:
-                sample = f.read(2048)
-                try:
-                    delimiter = csv.Sniffer().sniff(sample, delimiters=";,:|").delimiter
-                except csv.Error:
-                    delimiter = ";"
-                f.seek(0)
-                df = pd.read_csv(f, delimiter=delimiter, engine='python')
+            # Create cache directory if it doesn't exist
+            cache_dir = os.path.join(os.path.dirname(file_path), 'validatorAppCache')
+            if not os.path.exists(cache_dir):
+                os.makedirs(cache_dir)
+            
+            # Generate cache file paths in the cache directory
+            filename = os.path.basename(file_path)
+            cache_filename = os.path.splitext(filename)[0] + '_optimized'
+            parquet_path = os.path.join(cache_dir, cache_filename + '.parquet')
+            
+            if os.path.exists(parquet_path):
+                # Load from parquet for faster loading
+                self.df = pd.read_parquet(parquet_path, engine='pyarrow')
+                self.parquet_path = parquet_path
+                messagebox.showinfo("Success", 
+                                  "Loaded from optimized cache!\n"
+                                  "Rows: {:,}\n"
+                                  "Columns: {}".format(len(self.df), len(self.df.columns)))
+                
+                # Create Spark DataFrame once for faster SQL queries
+                if SPARK_AVAILABLE:
+                    self.sdf = spark.createDataFrame(self.df)
+                    self.sdf.createOrReplaceTempView("uploaded_data")
+                else:
+                    self.sdf = None
+            else:
+                # Load from CSV and create optimized versions
+                with open(file_path, 'r', encoding='iso-8859-1') as f:
+                    sample = f.read(2048)
+                    try:
+                        delimiter = csv.Sniffer().sniff(sample, delimiters=";,:|").delimiter
+                    except csv.Error:
+                        delimiter = ";"
+                    f.seek(0)
+                    df = pd.read_csv(f, delimiter=delimiter, engine='python')
 
-            df.columns = df.columns.str.strip().str.replace('\ufeff', '', regex=True)
-            self.df = df.copy()
-            self.df.insert(0, "Original Row#", self.df.index + 2)
+                df.columns = df.columns.str.strip().str.replace('\ufeff', '', regex=True)
+                self.df = df.copy()
+                self.df.insert(0, "Original Row#", self.df.index + 2)
+
+                # Save optimized versions for faster processing
+                pickle_path = os.path.join(cache_dir, cache_filename + '.pkl')
+                
+                # Save as pickle for small to medium files
+                self.df.to_pickle(pickle_path)
+                
+                # Save as parquet for large files (better compression and faster reading)
+                self.df.to_parquet(parquet_path, engine='pyarrow', compression='snappy')
+                
+                # Use parquet path for better performance
+                self.parquet_path = parquet_path
+                
+                messagebox.showinfo("Success", 
+                                  "CSV loaded successfully!\n"
+                                  "Rows: {:,}\n"
+                                  "Columns: {}\n"
+                                  "Optimized cache created for faster processing.".format(len(df), len(df.columns)))
+                
+                # Create Spark DataFrame once for faster SQL queries
+                self.sdf = spark.createDataFrame(self.df)
+                self.sdf.createOrReplaceTempView("uploaded_data")
 
             self.file_path = file_path
             self.populate_checkboxes()
-            #messagebox.showinfo("Success", f"Loaded: {file_path}\nDetected delimiter: '{delimiter}'")
+            
         except Exception as e:
             messagebox.showerror("Error", str(e))
         self.info_button.config(state=tk.NORMAL)
@@ -155,11 +224,11 @@ class CSVValidatorApp:
                     from tkinter import simpledialog
                     enum_values = simpledialog.askstring(
                         "ENUM Values",
-                        f"Enter allowed ENUM values for column '{col}' (comma-separated):"
+                        "Enter allowed ENUM values for column '{}' (comma-separated):".format(col)
                     )
                     if enum_values:
                         values_list = [v.strip() for v in enum_values.split(",")]
-                        dtype.set(f"enum:{','.join(values_list)}")
+                        dtype.set("enum:{}".format(','.join(values_list)))
                     else:
                         dtype.set("string")
                 else:
@@ -193,7 +262,7 @@ class CSVValidatorApp:
             messagebox.showinfo("Result", "✅ No duplicate key combinations found.")
         else:
             preview = duplicate_rows.head(10).copy()
-            summary = f"📊 Duplicate Rows Summary:\nTotal Rows in File: {len(self.df)}\nTotal Duplicates Found: {len(duplicate_rows)}\n\nSample Preview:\n"
+            summary = "📊 Duplicate Rows Summary:\nTotal Rows in File: {}\nTotal Duplicates Found: {}\n\nSample Preview:\n".format(len(self.df), len(duplicate_rows))
             sample_text = preview.to_csv(sep=";", index=False)
             self.show_popup("❗ Duplicate Sample", summary + sample_text, duplicate_rows)
 
@@ -209,9 +278,9 @@ class CSVValidatorApp:
         if null_counts.empty:
             messagebox.showinfo("Result", "✅ No missing values in selected columns.")
         else:
-            summary = f"📊 Missing Value Summary:\nTotal Rows in File: {len(self.df)}\nColumns Checked: {len(selected_cols)}\n\n"
+            summary = "📊 Missing Value Summary:\nTotal Rows in File: {}\nColumns Checked: {}\n\n".format(len(self.df), len(selected_cols))
             for col, count in null_counts.items():
-                summary += f"{col}: {count} missing values\n"
+                summary += "{}: {} missing values\n".format(col, count)
             missing_rows = self.df[self.df[selected_cols].isnull().any(axis=1)]
             sample = missing_rows.head(10).copy()
             sample_text = sample.to_csv(sep=";", index=False)
@@ -270,17 +339,17 @@ class CSVValidatorApp:
         if not errors:
             messagebox.showinfo("Result", "✅ All selected columns match expected data types and CSV formatting rules.")
         else:
-            summary = f"📊 Data Type Validation Summary:\nTotal Rows in File: {len(self.df)}\nColumns Checked: {len(selected_cols)}\n\n"
+            summary = "📊 Data Type Validation Summary:\nTotal Rows in File: {}\nColumns Checked: {}\n\n".format(len(self.df), len(selected_cols))
             error_rows = set()
             for col, rows in errors:
-                summary += f"🔹 {col}: {len(rows)} invalid entries\n"
-                error_rows.update(idx for idx, *_ in rows)
+                summary += "🔹 {}: {} invalid entries\n".format(col, len(rows))
+                error_rows.update(idx for idx, val, reason in rows)
 
             df_error = self.df.loc[list(error_rows)].copy()
             total_invalid = len(df_error)
             sample = df_error.head(10).to_csv(sep=";", index=False)
 
-            summary += f"\nNote: {total_invalid} invalid rows found. The download will include all of them.\n"
+            summary += "\nNote: {} invalid rows found. The download will include all of them.\n".format(total_invalid)
 
             self.show_popup("❌ Data Type & Format Errors", summary + "\nSample Rows:\n" + sample, df_error)
 
@@ -353,40 +422,95 @@ class CSVValidatorApp:
                 export_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
                 if export_path:
                     full_df.to_csv(export_path, index=False, sep=';')
-                    messagebox.showinfo("Saved", f"CSV exported to {export_path}")
+                    messagebox.showinfo("Saved", "CSV exported to {}".format(export_path))
 
         download_btn = tk.Button(btn_frame, text="Download All Invalid Rows", command=download_csv)
         download_btn.pack(side="left", padx=5)
 
         close_btn = tk.Button(btn_frame, text="Close", command=popup.destroy)
         close_btn.pack(side="right", padx=5)
+    def clear_cache(self):
+        """Clear all cache files from the cache directory"""
+        try:
+            if self.file_path:
+                # Get the cache directory for the current file
+                cache_dir = os.path.join(os.path.dirname(self.file_path), 'validatorAppCache')
+            else:
+                # If no file loaded, clear cache in current directory
+                cache_dir = 'validatorAppCache'
+            
+            if not os.path.exists(cache_dir):
+                messagebox.showinfo("Info", "Cache directory doesn't exist. Nothing to clear.")
+                return
+            
+            # Count files before deletion
+            cache_files = os.listdir(cache_dir)
+            if not cache_files:
+                messagebox.showinfo("Info", "Cache directory is already empty.")
+                return
+            
+            # Ask for confirmation
+            files_preview = ', '.join(cache_files[:3])
+            if len(cache_files) > 3:
+                files_preview += '...'
+            
+            result = messagebox.askyesno(
+                "Confirm Clear Cache", 
+                "Are you sure you want to clear all cache files?\n\n"
+                "Cache directory: {}\n"
+                "Files to delete: {}\n"
+                "Files: {}".format(cache_dir, len(cache_files), files_preview)
+            )
+            
+            if result:
+                # Delete all files in cache directory
+                for filename in cache_files:
+                    file_path = os.path.join(cache_dir, filename)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                
+                # Remove cache directory if empty
+                try:
+                    os.rmdir(cache_dir)
+                    messagebox.showinfo("Success", "Cache cleared successfully!\n\nCache directory removed: {}".format(cache_dir))
+                except OSError:
+                    # Directory not empty or other error
+                    messagebox.showinfo("Success", "Cache cleared successfully!\n\nFiles deleted from: {}".format(cache_dir))
+                
+                # Reset parquet path if it was pointing to cleared cache
+                if self.parquet_path and not os.path.exists(self.parquet_path):
+                    self.parquet_path = None
+                    
+        except Exception as e:
+            messagebox.showerror("Error", "Failed to clear cache:\n{}".format(str(e)))
+
     def show_data_info(self):
         if self.df is None:
             messagebox.showwarning("Warning", "No CSV loaded.")
             return
 
         info_lines = []
-        info_lines.append(f"✅ File Loaded: {self.file_path}")
-        info_lines.append(f"Total Rows: {len(self.df)}")
-        info_lines.append(f"Total Columns: {len(self.df.columns)}\n")
+        info_lines.append("✅ File Loaded: {}".format(self.file_path))
+        info_lines.append("Total Rows: {}".format(len(self.df)))
+        info_lines.append("Total Columns: {}\n".format(len(self.df.columns)))
 
         for col in self.df.columns:
             col_data = self.df[col]
-            info_lines.append(f"--- Column: {col} ---")
-            info_lines.append(f"Data Type: {col_data.dtype}")
-            info_lines.append(f"Nulls: {col_data.isnull().sum()}")
+            info_lines.append("--- Column: {} ---".format(col))
+            info_lines.append("Data Type: {}".format(col_data.dtype))
+            info_lines.append("Nulls: {}".format(col_data.isnull().sum()))
             unique_vals = col_data.dropna().unique()
-            info_lines.append(f"Unique Values: {len(unique_vals)}")
+            info_lines.append("Unique Values: {}".format(len(unique_vals)))
             if len(unique_vals) <= 10:
-                info_lines.append(f"Values: {', '.join(map(str, unique_vals))}")
+                info_lines.append("Values: {}".format(', '.join(map(str, unique_vals))))
             else:
                 top_vals = col_data.value_counts().head(5)
-                top_str = ", ".join(f"{v} ({c})" for v, c in top_vals.items())
-                info_lines.append(f"Top 5 Values: {top_str}")
+                top_str = ", ".join("{} ({})".format(v, c) for v, c in top_vals.items())
+                info_lines.append("Top 5 Values: {}".format(top_str))
             if pd.api.types.is_numeric_dtype(col_data):
-                info_lines.append(f"Min: {col_data.min()}")
-                info_lines.append(f"Max: {col_data.max()}")
-                info_lines.append(f"Mean: {round(col_data.mean(), 2)}")
+                info_lines.append("Min: {}".format(col_data.min()))
+                info_lines.append("Max: {}".format(col_data.max()))
+                info_lines.append("Mean: {}".format(round(col_data.mean(), 2)))
             info_lines.append("")  # add blank line
 
         final_text = "\n".join(info_lines)
@@ -417,8 +541,8 @@ class CSVValidatorApp:
             if not self.col_type_map:
                 mapping_label.config(text="Column Data Types: None")
             else:
-                display_text = ", ".join(f"{col}: {typ}" for col, typ in self.col_type_map.items())
-                mapping_label.config(text=f"Column Data Types: {display_text}")
+                display_text = ", ".join("{}: {}".format(col, typ) for col, typ in self.col_type_map.items())
+                mapping_label.config(text="Column Data Types: {}".format(display_text))
 
         # List to track all dropdown pairs
         self.mapping_widgets = []
@@ -467,7 +591,7 @@ class CSVValidatorApp:
         def submit():
             expr = text_box.get("1.0", tk.END).strip()
             if not expr:
-                messagebox.showerror("Error", "Please enter a Spark SQL expression.")
+                messagebox.showerror("Error", "Please enter a Spark SQL query.")
                 return
             self.latest_expr = expr
             dialog.destroy()
@@ -478,6 +602,19 @@ class CSVValidatorApp:
 
         result = {"input": None}
 
+    def validate_sql_query(self, expression, type_map):
+        """Simple validation - just check if it's a SELECT query"""
+        query_lower = expression.strip().lower()
+        if not query_lower.startswith('select'):
+            messagebox.showerror(
+                "Invalid Query Format",
+                "❌ Please enter a complete SQL query starting with SELECT.\n\n"
+                "Example: SELECT Age FROM uploaded_data\n"
+                "Example: SELECT Name, Age FROM uploaded_data WHERE Age > 18"
+            )
+            return False
+        return True
+
     def on_submit(self):
         expression = self.latest_expr  # Get stored expression
         if not expression:
@@ -485,8 +622,14 @@ class CSVValidatorApp:
             return
 
         type_map = self.col_type_map
+        
+        # Step 1: Simple validation - just check if it's a SELECT query
+        if not self.validate_sql_query(expression, type_map):
+            return  # Stop if validation fails
+        
+        # Step 2: Quick processing (no message needed - should be fast now)
 
-        # Cast columns first with error popup on failure
+        # Step 3: Cast columns with error popup on failure
         for col, dtype in type_map.items():
             if col in self.df.columns:
                 try:
@@ -501,38 +644,91 @@ class CSVValidatorApp:
                 except Exception as e:
                     messagebox.showerror(
                         "Casting Error",
-                        f"Column '{col}' has mixed or invalid data for type '{dtype}'.\n"
-                        f"Details: {e}"
+                        "Column '{}' has mixed or invalid data for type '{}'.\n"
+                        "Details: {}".format(col, dtype, e)
                     )
                     return  # stop further processing
 
-        # Now casted – apply the Spark SQL filter
+        # Step 4: Execute the SQL query with processing popup
         try:
-            sdf = spark.createDataFrame(self.df)
-            sdf.createOrReplaceTempView("uploaded_data")
+            # Show processing popup
+            processing_window = tk.Toplevel(self.master)
+            processing_window.title("Processing Query")
+            processing_window.geometry("400x150")
+            processing_window.resizable(False, False)
+            
+            # Center the window
+            processing_window.transient(self.master)
+            processing_window.grab_set()
+            
+            # Processing content
+            tk.Label(processing_window, text="🔄 Processing SQL Query...", 
+                    font=("Helvetica", 12, "bold")).pack(pady=20)
+            tk.Label(processing_window, text="Please wait while executing your query.", 
+                    font=("Helvetica", 10)).pack(pady=5)
+            
+            # Progress bar (simplified - just a visual indicator)
+            progress_frame = tk.Frame(processing_window)
+            progress_frame.pack(pady=20)
+            
+            progress_label = tk.Label(progress_frame, text="⏳ Executing query...", 
+                                    font=("Helvetica", 9), fg="blue")
+            progress_label.pack()
+            
+            # Update the window to show the popup
+            processing_window.update()
+            
+            # Use the pre-created Spark DataFrame for faster execution
+            if self.sdf is None:
+                # Fallback: create Spark DataFrame if not already created
+                self.sdf = spark.createDataFrame(self.df)
+                self.sdf.createOrReplaceTempView("uploaded_data")
+            
+            # Execute the complete SQL query
             query = expression
-            print(query)
             result_df = spark.sql(query)
-
-            if result_df.count() == 0:
-                messagebox.showinfo("Result", "✅ All rows satisfy the condition.")
+            
+            # Close processing popup
+            processing_window.destroy()
+            
+            # Show the results
+            if result_df.count() > 0:
+                result_rows = result_df.toPandas()
+                sample_text = result_rows.head(20).to_csv(sep=";", index=False)
+                summary = "Query Results: {} rows returned.\n\nSample Results:\n{}".format(len(result_rows), sample_text)
+                self.show_popup("Query Results", summary, result_rows)
             else:
-                invalid_rows = result_df.toPandas()
-                sample_text = invalid_rows.head(10).to_csv(sep=";", index=False)
-                summary = f"Found {len(invalid_rows)} rows satisfying condition.\nSample:\n{sample_text}"
-                self.show_popup("Validation Failed Rows", summary, invalid_rows)
+                messagebox.showinfo("Query Results", "✅ Query executed successfully - No rows returned.")
 
         except Exception as e:
-            messagebox.showerror("Error", f"Invalid Spark SQL expression:\n{e}")
+            # Close processing popup if it's still open
+            try:
+                processing_window.destroy()
+            except:
+                pass
+            messagebox.showerror("Error", "Invalid Spark SQL expression:\n{}".format(e))
 
 
 
     def validate_spark_sql_expression(self):
+        if not SPARK_AVAILABLE:
+            messagebox.showerror("Error", "PySpark is not available in this packaged version.\n\nSpark SQL features are disabled.")
+            return
+            
         self.get_large_input(
-            "Spark SQL Expression",
-            "Enter the Expression Spark SQL after the WHERE 'e.g. Quantity > 0 AND Country = 'USA'':"
+            "Spark SQL Query Executor",
+            "Enter your complete Spark SQL query:\n\n"
+            "📋 Examples:\n"
+            "• SELECT Age FROM uploaded_data\n"
+            "• SELECT Name, Age FROM uploaded_data WHERE Age > 18\n"
+            "• SELECT COUNT(*) FROM uploaded_data WHERE Country = 'USA'\n\n"
+            "💡 Tips:\n"
+            "• Must start with SELECT\n"
+            "• Use 'uploaded_data' as table name\n"
+            "• Use column names from your CSV\n"
+            "• Set data types for columns using the mapping below\n"
+            "• Use standard SQL operators: =, !=, >, <, AND, OR, etc."
         )
-
 
 
 
